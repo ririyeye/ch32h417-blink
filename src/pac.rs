@@ -111,11 +111,17 @@ pub fn hclk() -> u32 {
 const PFIC_IENR0: *mut u32 = 0xE000E100 as *mut u32;
 /// PFIC Interrupt Priority base (8-bit per IRQ)
 const PFIC_IPRIOR: *mut u8 = 0xE000E400 as *mut u8;
+/// PFIC Interrupt Allocate (IALLOCR): 0=V3F, 1=V5F
+const PFIC_IALLOCR: *mut u8 = 0xE000E500 as *mut u8;
 
 /// Initialize SysTick1 interrupt in PFIC.
 /// Must call once before using systick_delay_ms().
 pub fn systick_init() {
     unsafe {
+        // Route SysTick1 (IRQ 13) to V5F core.
+        // Reset default is 0 (V3F), but V3F is sleeping → interrupt lost.
+        write_volatile(PFIC_IALLOCR.offset(13), 1u8);
+
         // Set SysTick1 (IRQ 13) priority = 0 (lowest)
         write_volatile(PFIC_IPRIOR.offset(13), 0u8);
         // Enable SysTick1 in PFIC IENR0 (bit 13)
