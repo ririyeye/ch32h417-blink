@@ -4,6 +4,7 @@
 //!   ch32h417.h, core_riscv.h
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ── Clocks ─────────────────────────────────────────────────────
 
@@ -98,37 +99,84 @@ pub const STK1_BASE: u32 = 0xE000F080;
 /// SysTick0 base (used for ISR flags of both timers)
 pub const STK0_BASE: u32 = 0xE000F000;
 
+
 /// Get HCLK frequency. After reset, MCU runs on HSI.
-/// If you configure PLL, update this accordingly.
 pub fn hclk() -> u32 {
     HSI_VALUE
 }
 
-/// Polling delay using SysTick1 (V5F timer).
-/// Does NOT use interrupts — purely polling.
-pub fn delay_ms(ms: u32) {
+// ── PFIC ───────────────────────────────────────────────────────
+
+/// PFIC Interrupt Enable Register 0 (IRQ 0-31)
+const PFIC_IENR0: *mut u32 = 0xE000E100 as *mut u32;
+/// PFIC Interrupt Priority base (8-bit per IRQ)
+const PFIC_IPRIOR: *mut u8 = 0xE000E400 as *mut u8;
+
+/// Initialize SysTick1 interrupt in PFIC.
+/// Must call once before using systick_delay_ms().
+pub fn systick_init() {
+    unsafe {
+        // Set SysTick1 (IRQ 13) priority = 0 (lowest)
+        write_volatile(PFIC_IPRIOR.offset(13), 0u8);
+        // Enable SysTick1 in PFIC IENR0 (bit 13)
+        let ienr = read_volatile(PFIC_IENR0);
+        write_volatile(PFIC_IENR0, ienr | (1 << 13));
+    }
+}
+
+/// Interrupt flag: set by SysTick1 handler, checked by delay loop
+pub static TICK_EXPIRED: AtomicBool = AtomicBool::new(false);
+
+/// One-shot interrupt-driven delay using SysTick1.
+/// Puts the core into WFI sleep while waiting.
+pub fn systick_delay_ms(ms: u32) {
     let ticks = hclk() / 1000 * ms;
 
+    TICK_EXPIRED.store(false, Ordering::Release);
+
     unsafe {
-        // Clear SysTick1 flag (bit 1 in SysTick0.ISR, write-1-to-clear... wait -
-        // actually it's write-0-to-clear per C SDK: SysTick0->ISR &= ~(1<<1))
+        // Clear SysTick1 flag (bit 1 in SysTick0.ISR, write-0-to-clear)
         let stk0_isr = (STK0_BASE + STK_ISR_OFFSET) as *mut u32;
         write_volatile(stk0_isr, read_volatile(stk0_isr) & !(1 << 1));
 
-        // Reset counter
+        // Reset counter, set compare
         write_volatile((STK1_BASE + STK_CNT_OFFSET) as *mut u32, 0);
-        // Set compare value
         write_volatile((STK1_BASE + STK_CMP_OFFSET) as *mut u32, ticks);
-        // Start: bit2=clear-cnt, bit0=enable, clock=HCLK
+
+        // Start: bit3=HCLK, bit2=clear-cnt, bit1=interrupt-en, bit0=counter-en
         write_volatile(
             (STK1_BASE + STK_CTLR_OFFSET) as *mut u32,
-            (1 << 2) | (1 << 0),
+            (1 << 3) | (1 << 2) | (1 << 1) | (1 << 0),
         );
+    }
 
-        // Wait for flag
-        while read_volatile(stk0_isr) & (1 << 1) == 0 {}
+    // Wait for interrupt handler to signal completion
+    while !TICK_EXPIRED.load(Ordering::Acquire) {
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
+}
 
-        // Stop timer
-        write_volatile((STK1_BASE + STK_CTLR_OFFSET) as *mut u32, 0);
+/// SysTick1 interrupt handler (called from assembly shim).
+/// Clears the interrupt flag and sets TICK_EXPIRED.
+#[unsafe(no_mangle)]
+extern "C" fn __rust_systick1_handler() {
+    unsafe {
+        // Read SysTick1 flag from SysTick0.ISR bit1
+        let isr = read_volatile((STK0_BASE + STK_ISR_OFFSET) as *const u32);
+        if isr & (1 << 1) != 0 {
+            // Write-0-to-clear: SysTick0->ISR &= ~(1<<1)
+            write_volatile(
+                (STK0_BASE + STK_ISR_OFFSET) as *mut u32,
+                isr & !(1 << 1),
+            );
+
+            // Stop timer
+            write_volatile((STK1_BASE + STK_CTLR_OFFSET) as *mut u32, 0);
+
+            // Signal main loop
+            TICK_EXPIRED.store(true, Ordering::Release);
+        }
     }
 }

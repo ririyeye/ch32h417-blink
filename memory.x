@@ -14,6 +14,8 @@ SECTIONS
     .text :
     {
         *(.init)
+        *(.vector)
+        *(.trap)
         *(.text .text.*)
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
